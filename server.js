@@ -1,3 +1,9 @@
+// Polyfill crypto for Baileys compatibility (Node 18 fallback)
+if (!globalThis.crypto) {
+  const { webcrypto } = require('crypto');
+  globalThis.crypto = webcrypto;
+}
+
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, makeInMemoryStore } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
