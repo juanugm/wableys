@@ -177,15 +177,16 @@ const authMiddleware = (req, res, next) => {
 };
 
 // Initialize WhatsApp client with Baileys
-async function initializeClient(agentId) {
-  console.log(`📱 Initializing Baileys client for agent: ${agentId}`);
+async function initializeClient(agentId, isReconnect = false) {
+  console.log(`📱 Initializing Baileys client for agent: ${agentId} (isReconnect: ${isReconnect})`);
   
   const authPath = path.join(AUTH_DIR, agentId);
   
-  // Clean potentially corrupt auth from failed previous attempts
-  if (!clients.has(agentId) || clientStates.get(agentId) !== 'open') {
+  // Only clean auth on fresh /init requests, NOT during automatic reconnections
+  // During reconnections (e.g. after 515 error), partial pairing creds must be preserved
+  if (!isReconnect && !clients.has(agentId)) {
     if (fsSync.existsSync(authPath)) {
-      console.log(`🧹 Cleaning potentially corrupt auth for ${agentId}`);
+      console.log(`🧹 Cleaning auth for fresh init: ${agentId}`);
       fsSync.rmSync(authPath, { recursive: true, force: true });
     }
   }
@@ -329,7 +330,7 @@ async function initializeClient(agentId) {
             console.log(`🔄 Reconnect attempt ${attempts}/${MAX_RECONNECT_ATTEMPTS} for ${agentId} in ${delay/1000}s...`);
             await new Promise(r => setTimeout(r, delay));
             try {
-              const reconnected = await initializeClient(agentId);
+              const reconnected = await initializeClient(agentId, true); // true = reconnect, preserve auth
               clients.set(agentId, reconnected);
             } catch (reconnectError) {
               console.error(`❌ Reconnect failed for ${agentId}:`, reconnectError.message);
@@ -697,7 +698,9 @@ app.get('/status/:agent_id', authMiddleware, async (req, res) => {
         state: 'CONNECTED'
       });
     } else {
-      res.json({ connected: false, state: currentState || 'unknown' });
+      // Include latest QR code if available (for reconnection scenarios)
+      const latestQr = qrCodes.get(agent_id);
+      res.json({ connected: false, state: currentState || 'unknown', qr_code: latestQr || null });
     }
   } catch (error) {
     console.error('Error checking status:', error);
