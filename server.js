@@ -5,7 +5,7 @@ if (!globalThis.crypto) {
 }
 
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, makeInMemoryStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, makeInMemoryStore, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const cors = require('cors');
 const fs = require('fs').promises;
@@ -195,13 +195,22 @@ async function initializeClient(agentId) {
   // Create in-memory store for contacts/chats
   const store = makeInMemoryStore({ logger });
   
-  // Use Baileys built-in version (don't fetch latest - it can be incompatible)
-  console.log(`📦 Using Baileys built-in WA version (no fetchLatestBaileysVersion)`);
+  // Fetch latest WA version for protocol compatibility
+  let version;
+  try {
+    const versionInfo = await fetchLatestBaileysVersion();
+    version = versionInfo.version;
+    console.log(`📦 Using WA version: ${version.join('.')}`);
+  } catch (e) {
+    console.log(`📦 Could not fetch latest version, using built-in`);
+    version = undefined;
+  }
   
   return new Promise((resolve, reject) => {
     const sock = makeWASocket({
       auth: state,
       logger,
+      version,
       browser: ['AIA', 'Chrome', '1.0'],
       printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
