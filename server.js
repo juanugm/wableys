@@ -5,7 +5,7 @@ if (!globalThis.crypto) {
 }
 
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, makeInMemoryStore, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const cors = require('cors');
 const fs = require('fs').promises;
@@ -192,8 +192,8 @@ async function initializeClient(agentId) {
   
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
   
-  // Create in-memory store for contacts/chats
-  const store = makeInMemoryStore({ logger });
+  // Simple in-memory contacts store (makeInMemoryStore removed in newer Baileys)
+  const store = { contacts: {} };
   
   // Fetch latest WA version for protocol compatibility
   let version;
@@ -202,8 +202,8 @@ async function initializeClient(agentId) {
     version = versionInfo.version;
     console.log(`📦 Using WA version: ${version.join('.')}`);
   } catch (e) {
-    console.log(`📦 Could not fetch latest version, using built-in`);
-    version = undefined;
+    version = [2, 3000, 1027934701];
+    console.log(`📦 Could not fetch latest version, using fallback: ${version.join('.')}`);
   }
   
   return new Promise((resolve, reject) => {
@@ -211,15 +211,26 @@ async function initializeClient(agentId) {
       auth: state,
       logger,
       version,
-      browser: ['AIA', 'Chrome', '1.0'],
+      browser: ['Baileys', 'Chrome', '4.0.0'],
       printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
       markOnlineOnConnect: false,
     });
     
-    // Bind store to socket events
-    store.bind(sock.ev);
+    // Populate contacts store from socket events
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts) {
+        store.contacts[c.id] = c;
+      }
+    });
+    sock.ev.on('contacts.update', (updates) => {
+      for (const u of updates) {
+        if (store.contacts[u.id]) {
+          Object.assign(store.contacts[u.id], u);
+        }
+      }
+    });
     
     let qrResolved = false;
     
