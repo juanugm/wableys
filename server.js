@@ -1,5 +1,5 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, makeInMemoryStore, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, makeInMemoryStore } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const cors = require('cors');
 const fs = require('fs').promises;
@@ -175,18 +175,25 @@ async function initializeClient(agentId) {
   console.log(`📱 Initializing Baileys client for agent: ${agentId}`);
   
   const authPath = path.join(AUTH_DIR, agentId);
+  
+  // Clean potentially corrupt auth from failed previous attempts
+  if (!clients.has(agentId) || clientStates.get(agentId) !== 'open') {
+    if (fsSync.existsSync(authPath)) {
+      console.log(`🧹 Cleaning potentially corrupt auth for ${agentId}`);
+      fsSync.rmSync(authPath, { recursive: true, force: true });
+    }
+  }
+  
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
   
   // Create in-memory store for contacts/chats
   const store = makeInMemoryStore({ logger });
   
-  // Get latest Baileys version
-  const { version } = await fetchLatestBaileysVersion();
-  console.log(`📦 Using Baileys with WA version: ${version.join('.')}`);
+  // Use Baileys built-in version (don't fetch latest - it can be incompatible)
+  console.log(`📦 Using Baileys built-in WA version (no fetchLatestBaileysVersion)`);
   
   return new Promise((resolve, reject) => {
     const sock = makeWASocket({
-      version,
       auth: state,
       logger,
       browser: ['AIA', 'Chrome', '1.0'],
