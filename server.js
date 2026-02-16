@@ -33,6 +33,9 @@ const clients = new Map();      // agentId -> { sock, store, saveCreds }
 const qrCodes = new Map();      // agentId -> base64 QR image
 const qrTimeouts = new Map();   // agentId -> timeout handle
 const clientStates = new Map(); // agentId -> 'connecting' | 'open' | 'close'
+const reconnectAttempts = new Map(); // agentId -> reconnect attempt count
+
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 // Auth sessions directory
 const AUTH_DIR = path.join(__dirname, 'auth_sessions');
@@ -237,6 +240,7 @@ async function initializeClient(agentId) {
         console.log(`✅ WhatsApp client ready for ${agentId}`);
         clearQrTimeout(agentId);
         clientStates.set(agentId, 'open');
+        reconnectAttempts.delete(agentId); // Reset reconnect counter on success
         
         const phoneNumber = jidToPhone(sock.user?.id || '');
         console.log(`📞 Phone number: ${phoneNumber}`);
@@ -274,21 +278,36 @@ async function initializeClient(agentId) {
       
       // Connection closed
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const error = lastDisconnect?.error;
+        const statusCode = error?.output?.statusCode || error?.statusCode;
+        const errorMessage = error?.message || error?.output?.payload?.message || 'Unknown';
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        console.log(`🔌 Connection closed for ${agentId}. Status: ${statusCode}. Reconnect: ${shouldReconnect}`);
+        console.log(`🔌 Connection closed for ${agentId}. Status: ${statusCode}. Error: ${errorMessage}. Reconnect: ${shouldReconnect}`);
+        console.log(`🔍 Full error:`, JSON.stringify(error, null, 2));
         clientStates.set(agentId, 'close');
         
         if (shouldReconnect) {
-          // Auto-reconnect (e.g., network issues)
-          console.log(`🔄 Attempting reconnect for ${agentId}...`);
-          try {
-            const reconnected = await initializeClient(agentId);
-            clients.set(agentId, reconnected);
-          } catch (error) {
-            console.error(`❌ Reconnect failed for ${agentId}:`, error.message);
+          const attempts = (reconnectAttempts.get(agentId) || 0) + 1;
+          reconnectAttempts.set(agentId, attempts);
+          
+          if (attempts <= MAX_RECONNECT_ATTEMPTS) {
+            const delay = Math.min(attempts * 2000, 10000);
+            console.log(`🔄 Reconnect attempt ${attempts}/${MAX_RECONNECT_ATTEMPTS} for ${agentId} in ${delay/1000}s...`);
+            await new Promise(r => setTimeout(r, delay));
+            try {
+              const reconnected = await initializeClient(agentId);
+              clients.set(agentId, reconnected);
+            } catch (reconnectError) {
+              console.error(`❌ Reconnect failed for ${agentId}:`, reconnectError.message);
+              clients.delete(agentId);
+              clientStates.delete(agentId);
+            }
+          } else {
+            console.log(`🛑 Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached for ${agentId}. Stopping.`);
+            reconnectAttempts.delete(agentId);
             clients.delete(agentId);
+            qrCodes.delete(agentId);
             clientStates.delete(agentId);
           }
         } else {
@@ -298,6 +317,7 @@ async function initializeClient(agentId) {
           clients.delete(agentId);
           qrCodes.delete(agentId);
           clientStates.delete(agentId);
+          reconnectAttempts.delete(agentId);
           
           // Delete auth data since user logged out
           const authDir = path.join(AUTH_DIR, agentId);
@@ -312,7 +332,7 @@ async function initializeClient(agentId) {
         
         if (!qrResolved) {
           qrResolved = true;
-          reject(new Error(`Connection closed: ${statusCode}`));
+          reject(new Error(`Connection closed: ${statusCode} - ${errorMessage}`));
         }
       }
     });
