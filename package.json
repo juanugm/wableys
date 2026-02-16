@@ -8,7 +8,7 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.17",
+    "@whiskeysockets/baileys": "latest",
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "qrcode": "^1.5.3",
