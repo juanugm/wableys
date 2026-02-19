@@ -125,8 +125,8 @@ function detectMessageType(message) {
 }
 
 // Destroy client and clean up
-async function destroyClient(agentId) {
-  console.log(`🗑️ Destroying client for ${agentId}`);
+async function destroyClient(agentId, deleteAuthData = true) {
+  console.log(`🗑️ Destroying client for ${agentId} (deleteAuthData: ${deleteAuthData})`);
   
   clearQrTimeout(agentId);
   
@@ -134,11 +134,15 @@ async function destroyClient(agentId) {
   
   if (clientData && clientData.sock) {
     try {
-      await clientData.sock.logout();
-      console.log(`✅ Client logged out`);
+      if (deleteAuthData) {
+        await clientData.sock.logout();
+        console.log(`✅ Client logged out`);
+      } else {
+        clientData.sock.end();
+        console.log(`✅ Client socket closed (soft cleanup)`);
+      }
     } catch (error) {
-      console.error(`⚠️ Error logging out client for ${agentId}:`, error.message);
-      // Try to close the socket even if logout fails
+      console.error(`⚠️ Error closing client for ${agentId}:`, error.message);
       try {
         clientData.sock.end();
       } catch (e) {
@@ -147,16 +151,18 @@ async function destroyClient(agentId) {
     }
   }
   
-  // Delete auth session data from disk
-  const authPath = path.join(AUTH_DIR, agentId);
-  try {
-    if (fsSync.existsSync(authPath)) {
-      console.log(`🗑️ Deleting auth session data at: ${authPath}`);
-      fsSync.rmSync(authPath, { recursive: true, force: true });
-      console.log(`✅ Auth session data deleted`);
+  // Only delete auth session data from disk if explicitly requested
+  if (deleteAuthData) {
+    const authPath = path.join(AUTH_DIR, agentId);
+    try {
+      if (fsSync.existsSync(authPath)) {
+        console.log(`🗑️ Deleting auth session data at: ${authPath}`);
+        fsSync.rmSync(authPath, { recursive: true, force: true });
+        console.log(`✅ Auth session data deleted`);
+      }
+    } catch (error) {
+      console.error(`⚠️ Error deleting auth session:`, error.message);
     }
-  } catch (error) {
-    console.error(`⚠️ Error deleting auth session:`, error.message);
   }
   
   clients.delete(agentId);
@@ -249,8 +255,8 @@ async function initializeClient(agentId, isReconnect = false) {
           // Set QR timeout
           clearQrTimeout(agentId);
           const timeout = setTimeout(async () => {
-            console.log(`⏰ QR timeout expired for ${agentId} - destroying client`);
-            await destroyClient(agentId);
+            console.log(`⏰ QR timeout expired for ${agentId} - soft cleanup (preserving auth)`);
+            await destroyClient(agentId, false);
           }, QR_TIMEOUT_MS);
           qrTimeouts.set(agentId, timeout);
           console.log(`⏰ QR timeout set for ${agentId} (${QR_TIMEOUT_MS / 1000}s)`);
@@ -343,6 +349,22 @@ async function initializeClient(agentId, isReconnect = false) {
             clients.delete(agentId);
             qrCodes.delete(agentId);
             clientStates.delete(agentId);
+            
+            // Notify Supabase to mark session as inactive
+            try {
+              const connectUrl = WEBHOOK_URL.replace('webhook-whatsapp-personal', 'whatsapp-personal-connect');
+              await fetch(connectUrl, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${MICROSERVICE_SECRET}`
+                },
+                body: JSON.stringify({ action: 'disconnect', agent_id: agentId })
+              });
+              console.log(`✅ Supabase notified: session inactive for ${agentId}`);
+            } catch (e) {
+              console.error(`⚠️ Could not notify Supabase:`, e.message);
+            }
           }
         } else {
           // Logged out by user - clean up
@@ -840,9 +862,9 @@ setInterval(async () => {
   for (const [agentId] of clients) {
     const state = clientStates.get(agentId);
     
-    if (state !== 'open' && state !== 'connecting') {
+    if (state !== 'open' && state !== 'connecting' && !reconnectAttempts.has(agentId)) {
       console.log(`🗑️ Cleaning up disconnected client: ${agentId} (state: ${state || 'unknown'})`);
-      await destroyClient(agentId);
+      await destroyClient(agentId, false); // Soft cleanup: preserve auth on disk
       cleanedUp++;
     }
   }
