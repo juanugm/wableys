@@ -761,6 +761,27 @@ app.post('/send', authMiddleware, async (req, res) => {
       formattedNumber = to.replace('@c.us', '@s.whatsapp.net');
     }
     
+    // Verify number exists on WhatsApp and get correct JID
+    if (!to.includes('@g.us')) {
+      const rawNumber = formattedNumber.replace('@s.whatsapp.net', '');
+      try {
+        const [result] = await clientData.sock.onWhatsApp(rawNumber);
+        
+        if (!result || !result.exists) {
+          console.log(`❌ Number not on WhatsApp: ${rawNumber}`);
+          return res.status(400).json({ 
+            error: `El número ${rawNumber} no está registrado en WhatsApp` 
+          });
+        }
+        
+        // Use the JID that WhatsApp returns (correct format)
+        formattedNumber = result.jid;
+        console.log(`✅ Number verified: ${rawNumber} → ${formattedNumber}`);
+      } catch (verifyError) {
+        console.warn(`⚠️ Could not verify number ${rawNumber}, sending anyway:`, verifyError.message);
+      }
+    }
+    
     const result = await clientData.sock.sendMessage(formattedNumber, { text: content });
     
     console.log('✅ Message sent:', result.key.id);
