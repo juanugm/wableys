@@ -624,6 +624,21 @@ async function initializeClient(agentId, isReconnect = false) {
                 console.error('❌ Failed to encode voice base64:', b64err.message);
               }
             }
+            // Fallback: send base64 for PDF documents when upload failed
+            if (messageType === 'media' && baileysType === 'document' && !mediaUrl && mediaBuffer) {
+              try {
+                const base64Doc = mediaBuffer.toString('base64');
+                if (base64Doc.length < 8 * 1024 * 1024) { // Only if < 8MB base64
+                  messageMetadata.media_base64 = base64Doc;
+                  messageMetadata.media_size = mediaBuffer.length;
+                  console.log(`📦 Document base64 fallback attached, size: ${mediaBuffer.length} bytes`);
+                } else {
+                  console.warn('⚠️ Document too large for base64 fallback:', mediaBuffer.length);
+                }
+              } catch (b64err) {
+                console.error('❌ Failed to encode document base64:', b64err.message);
+              }
+            }
             console.log(`📋 Voice metadata: downloadStrategy=${typeof downloadStrategy !== 'undefined' ? downloadStrategy : 'n/a'}, has_buffer=${!!mediaBuffer}, has_url=${!!mediaUrl}, has_filename=${!!mediaFileName}, has_base64=${!!messageMetadata.media_base64}`);
           }
           
