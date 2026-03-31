@@ -41,8 +41,10 @@ const qrCodes = new Map();      // agentId -> base64 QR image
 const qrTimeouts = new Map();   // agentId -> timeout handle
 const clientStates = new Map(); // agentId -> 'connecting' | 'open' | 'close'
 const reconnectAttempts = new Map(); // agentId -> reconnect attempt count
+const sentMessages = new Map();     // messageId -> { conversation: content } for retry decryption
 
 const MAX_RECONNECT_ATTEMPTS = 5;
+const MAX_SENT_MESSAGES_CACHE = 1000;
 
 // Auth sessions directory
 const AUTH_DIR = path.join(__dirname, 'auth_sessions');
@@ -239,6 +241,13 @@ async function initializeClient(agentId, isReconnect = false) {
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      getMessage: async (key) => {
+        const msg = sentMessages.get(key.id);
+        if (msg) {
+          console.log(`🔄 getMessage retry for ${key.id} — returning cached content`);
+        }
+        return msg || undefined;
+      },
     });
     
     // Populate contacts store from socket events
@@ -892,6 +901,16 @@ app.post('/send', authMiddleware, async (req, res) => {
     }
     
     const result = await clientData.sock.sendMessage(formattedNumber, { text: content });
+    
+    // Cache sent message for decryption retry (mobile "waiting for message" fix)
+    if (result?.key?.id) {
+      sentMessages.set(result.key.id, { conversation: content });
+      // Evict oldest entries if cache exceeds limit
+      if (sentMessages.size > MAX_SENT_MESSAGES_CACHE) {
+        const firstKey = sentMessages.keys().next().value;
+        sentMessages.delete(firstKey);
+      }
+    }
     
     console.log('✅ Message sent:', result.key.id);
     
