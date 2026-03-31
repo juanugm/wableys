@@ -21,6 +21,7 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://wmzbqsegsyagcjgxefqs.sup
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'your-secret-key-here';
 const MICROSERVICE_SECRET = process.env.MICROSERVICE_SECRET || 'your-secret-key-here';
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // ⚙️ OPTIMIZATION SETTINGS (same as before)
 const MAX_CONCURRENT_SESSIONS = 5;
@@ -477,7 +478,7 @@ async function initializeClient(agentId, isReconnect = false) {
                 const storageResponse = await fetch(storageUrl, {
                   method: 'POST',
                   headers: {
-                    'Authorization': `Bearer ${WEBHOOK_SECRET}`,
+                    'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY || WEBHOOK_SECRET}`,
                     'Content-Type': mimeType,
                   },
                   body: buffer
@@ -950,3 +951,4 @@ app.listen(PORT, () => {
   // Restore sessions after server is listening
   restoreSessions();
 });
+
