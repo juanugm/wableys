@@ -598,6 +598,10 @@ async function initializeClient(agentId, isReconnect = false) {
               || unwrappedContent.documentMessage?.mimetype
               || unwrappedContent.stickerMessage?.mimetype
               || null;
+            // Include original filename for documents (PDFs etc.)
+            if (baileysType === 'document') {
+              messageMetadata.document_original_filename = unwrappedContent.documentMessage?.fileName || null;
+            }
             // Always send filename + url for media
             if (mediaUrl) {
               messageMetadata.media_url = mediaUrl;
