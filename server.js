@@ -5,7 +5,7 @@ if (!globalThis.crypto) {
 }
 
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage, downloadContentFromMessage, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const cors = require('cors');
 const fs = require('fs').promises;
@@ -107,20 +107,35 @@ function extractMessageText(message) {
     || '';
 }
 
-// Helper: detect message type from Baileys message
+// Helper: unwrap nested Baileys message containers
+function unwrapMessage(message) {
+  if (!message) return message;
+  if (message.ephemeralMessage) return unwrapMessage(message.ephemeralMessage.message);
+  if (message.viewOnceMessage) return unwrapMessage(message.viewOnceMessage.message);
+  if (message.viewOnceMessageV2) return unwrapMessage(message.viewOnceMessageV2.message);
+  if (message.viewOnceMessageV2Extension) return unwrapMessage(message.viewOnceMessageV2Extension.message);
+  if (message.documentWithCaptionMessage) return unwrapMessage(message.documentWithCaptionMessage.message);
+  if (message.editedMessage) return unwrapMessage(message.editedMessage.message);
+  return message;
+}
+
+// Helper: detect message type from Baileys message (uses unwrapped content)
 function detectMessageType(message) {
   if (!message) return { type: 'text', baileysType: null };
   
-  if (message.imageMessage) return { type: 'media', baileysType: 'image' };
-  if (message.videoMessage) return { type: 'media', baileysType: 'video' };
-  if (message.audioMessage) {
-    return message.audioMessage.ptt 
+  // Unwrap nested containers first
+  const unwrapped = unwrapMessage(message);
+  
+  if (unwrapped.imageMessage) return { type: 'media', baileysType: 'image' };
+  if (unwrapped.videoMessage) return { type: 'media', baileysType: 'video' };
+  if (unwrapped.audioMessage) {
+    return unwrapped.audioMessage.ptt 
       ? { type: 'voice', baileysType: 'ptt' }
       : { type: 'media', baileysType: 'audio' };
   }
-  if (message.documentMessage) return { type: 'media', baileysType: 'document' };
-  if (message.stickerMessage) return { type: 'sticker', baileysType: 'sticker' };
-  if (message.extendedTextMessage?.contextInfo?.quotedMessage) return { type: 'reply', baileysType: 'text' };
+  if (unwrapped.documentMessage) return { type: 'media', baileysType: 'document' };
+  if (unwrapped.stickerMessage) return { type: 'sticker', baileysType: 'sticker' };
+  if (unwrapped.extendedTextMessage?.contextInfo?.quotedMessage) return { type: 'reply', baileysType: 'text' };
   
   return { type: 'text', baileysType: 'text' };
 }
@@ -435,7 +450,8 @@ async function initializeClient(agentId, isReconnect = false) {
           
           console.log(`📨 Message ${fromMe ? 'SENT' : 'RECEIVED'} ${fromMe ? 'to' : 'from'} ${contactName} (${jidToPhone(conversationTarget)})`);
           
-          // Detect message type
+          // Detect message type (using unwrapped content)
+          const unwrappedContent = unwrapMessage(messageContent);
           const { type: messageType, baileysType } = detectMessageType(messageContent);
           
           // Build metadata (same structure as original webhook)
@@ -451,22 +467,87 @@ async function initializeClient(agentId, isReconnect = false) {
           // Download multimedia (only for received messages)
           let mediaUrl = null;
           let mediaFileName = null;
+          let mediaBuffer = null;
           
           if ((messageType === 'media' || messageType === 'voice' || messageType === 'sticker') && !fromMe) {
+            let downloadStrategy = 'none';
             try {
               console.log(`📥 Downloading media (type: ${baileysType})...`);
-              const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-                logger,
-                reuploadRequest: sock.updateMediaMessage
-              });
               
-              if (buffer) {
+              // Strategy 1: Standard downloadMediaMessage with buffer
+              try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                  logger,
+                  reuploadRequest: sock.updateMediaMessage
+                });
+                if (buffer && buffer.length > 0) {
+                  mediaBuffer = buffer;
+                  downloadStrategy = 'buffer';
+                  console.log(`✅ Media downloaded via buffer strategy, size: ${buffer.length} bytes`);
+                } else {
+                  console.warn('⚠️ downloadMediaMessage returned empty buffer');
+                }
+              } catch (bufErr) {
+                console.warn('⚠️ Buffer download failed:', bufErr.message);
+              }
+
+              // Strategy 2: Stream download (only for voice/audio if buffer failed)
+              if (!mediaBuffer && (messageType === 'voice' || baileysType === 'audio')) {
+                try {
+                  console.log('🔄 Trying stream download strategy...');
+                  const stream = await downloadMediaMessage(msg, 'stream', {}, {
+                    logger,
+                    reuploadRequest: sock.updateMediaMessage
+                  });
+                  if (stream) {
+                    const chunks = [];
+                    for await (const chunk of stream) {
+                      chunks.push(chunk);
+                    }
+                    const combined = Buffer.concat(chunks);
+                    if (combined.length > 0) {
+                      mediaBuffer = combined;
+                      downloadStrategy = 'stream';
+                      console.log(`✅ Media downloaded via stream strategy, size: ${combined.length} bytes`);
+                    }
+                  }
+                } catch (streamErr) {
+                  console.warn('⚠️ Stream download failed:', streamErr.message);
+                }
+              }
+
+              // Strategy 3: downloadContentFromMessage for voice/PTT
+              if (!mediaBuffer && (messageType === 'voice' || baileysType === 'audio' || baileysType === 'ptt')) {
+                try {
+                  const audioMsg = unwrappedContent.audioMessage;
+                  if (audioMsg) {
+                    const mediaType = audioMsg.ptt ? 'ptt' : 'audio';
+                    console.log(`🔄 Trying downloadContentFromMessage (${mediaType})...`);
+                    const stream = await downloadContentFromMessage(audioMsg, mediaType);
+                    const chunks = [];
+                    for await (const chunk of stream) {
+                      chunks.push(chunk);
+                    }
+                    const combined = Buffer.concat(chunks);
+                    if (combined.length > 0) {
+                      mediaBuffer = combined;
+                      downloadStrategy = 'contentFromMessage';
+                      console.log(`✅ Media downloaded via downloadContentFromMessage, size: ${combined.length} bytes`);
+                    }
+                  }
+                } catch (contentErr) {
+                  console.warn('⚠️ downloadContentFromMessage failed:', contentErr.message);
+                }
+              }
+
+              // Upload to Storage if we got a buffer
+              if (mediaBuffer) {
                 const timestamp = Date.now();
-                const mimeType = messageContent.imageMessage?.mimetype
-                  || messageContent.videoMessage?.mimetype
-                  || messageContent.audioMessage?.mimetype
-                  || messageContent.documentMessage?.mimetype
-                  || messageContent.stickerMessage?.mimetype
+                const mimeType = unwrappedContent.imageMessage?.mimetype
+                  || unwrappedContent.videoMessage?.mimetype
+                  || unwrappedContent.audioMessage?.mimetype
+                  || unwrappedContent.documentMessage?.mimetype
+                  || unwrappedContent.stickerMessage?.mimetype
                   || 'application/octet-stream';
                 const extension = mimeType.split('/')[1]?.split(';')[0] || 'bin';
                 mediaFileName = `whatsapp-${msg.key.id}-${timestamp}.${extension}`;
@@ -481,7 +562,7 @@ async function initializeClient(agentId, isReconnect = false) {
                     'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY || WEBHOOK_SECRET}`,
                     'Content-Type': mimeType,
                   },
-                  body: buffer
+                  body: mediaBuffer
                 });
                 
                 if (storageResponse.ok) {
@@ -491,6 +572,8 @@ async function initializeClient(agentId, isReconnect = false) {
                   const errorText = await storageResponse.text();
                   console.error('❌ Failed to upload media:', errorText);
                 }
+              } else {
+                console.error(`❌ All download strategies failed for ${messageType}/${baileysType}`);
               }
             } catch (error) {
               console.error('❌ Error downloading/uploading media:', error.message);
@@ -500,10 +583,35 @@ async function initializeClient(agentId, isReconnect = false) {
           // Add media metadata
           if (messageType === 'media' || messageType === 'voice' || messageType === 'sticker') {
             messageMetadata.media_type = baileysType;
+            messageMetadata.media_mime_type = unwrappedContent.audioMessage?.mimetype
+              || unwrappedContent.imageMessage?.mimetype
+              || unwrappedContent.videoMessage?.mimetype
+              || unwrappedContent.documentMessage?.mimetype
+              || unwrappedContent.stickerMessage?.mimetype
+              || null;
+            // Always send filename + url for media
             if (mediaUrl) {
               messageMetadata.media_url = mediaUrl;
+            }
+            if (mediaFileName) {
               messageMetadata.media_filename = mediaFileName;
             }
+            // Fallback: send base64 for voice notes when upload failed
+            if (messageType === 'voice' && !mediaUrl && mediaBuffer) {
+              try {
+                const base64Audio = mediaBuffer.toString('base64');
+                if (base64Audio.length < 5 * 1024 * 1024) { // Only if < 5MB base64
+                  messageMetadata.media_base64 = base64Audio;
+                  messageMetadata.media_size = mediaBuffer.length;
+                  console.log(`📦 Voice base64 fallback attached, size: ${mediaBuffer.length} bytes`);
+                } else {
+                  console.warn('⚠️ Voice too large for base64 fallback:', mediaBuffer.length);
+                }
+              } catch (b64err) {
+                console.error('❌ Failed to encode voice base64:', b64err.message);
+              }
+            }
+            console.log(`📋 Voice metadata: downloadStrategy=${typeof downloadStrategy !== 'undefined' ? downloadStrategy : 'n/a'}, has_buffer=${!!mediaBuffer}, has_url=${!!mediaUrl}, has_filename=${!!mediaFileName}, has_base64=${!!messageMetadata.media_base64}`);
           }
           
           // Handle quoted/reply messages
@@ -519,7 +627,7 @@ async function initializeClient(agentId, isReconnect = false) {
           }
           
           if (messageType === 'voice') {
-            messageMetadata.voice_duration = messageContent.audioMessage?.seconds || null;
+            messageMetadata.voice_duration = unwrappedContent.audioMessage?.seconds || null;
           }
           
           // Build message body (same format as original)
@@ -951,4 +1059,3 @@ app.listen(PORT, () => {
   // Restore sessions after server is listening
   restoreSessions();
 });
-
