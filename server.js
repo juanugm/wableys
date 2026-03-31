@@ -897,6 +897,77 @@ setInterval(async () => {
   }
 }, CLEANUP_INTERVAL_MS);
 
+// Auto-restore saved sessions on boot
+async function restoreSessions() {
+  try {
+    if (!fsSync.existsSync(AUTH_DIR)) return;
+    
+    const dirs = fsSync.readdirSync(AUTH_DIR).filter(d => {
+      const fullPath = path.join(AUTH_DIR, d);
+      return fsSync.statSync(fullPath).isDirectory()
+        && fsSync.existsSync(path.join(fullPath, 'creds.json'));
+    });
+
+    if (dirs.length === 0) {
+      console.log('📂 No saved sessions found to restore');
+      return;
+    }
+
+    console.log(`🔄 Found ${dirs.length} saved session(s) to restore...`);
+
+    for (const agentId of dirs) {
+      if (clients.has(agentId)) {
+        console.log(`⏭️ Session ${agentId} already active, skipping`);
+        continue;
+      }
+      try {
+        console.log(`🔄 Restoring session: ${agentId}`);
+        const clientData = await initializeClient(agentId, true);
+        clients.set(agentId, clientData);
+        console.log(`✅ Session restored: ${agentId}`);
+      } catch (err) {
+        console.error(`❌ Failed to restore session ${agentId}:`, err.message);
+      }
+    }
+
+    console.log(`🔄 Session restoration complete. Active sessions: ${clients.size}`);
+  } catch (err) {
+    console.error('❌ Error during session restoration:', err.message);
+  }
+}
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 WhatsApp Baileys Microservice running on port ${PORT}`);
+  console.log(`📦 Engine: Baileys (WebSocket, no Chromium)`);
+  console.log(`📍 Webhook URL: ${WEBHOOK_URL}`);
+  console.log(`🔐 Auth configured: ${MICROSERVICE_SECRET !== 'your-secret-key-here'}`);
+  console.log(`⚙️ Max concurrent sessions: ${MAX_CONCURRENT_SESSIONS}`);
+  console.log(`⏰ QR timeout: ${QR_TIMEOUT_MS / 1000} seconds`);
+  console.log(`🧹 Cleanup interval: ${CLEANUP_INTERVAL_MS / 1000} seconds`);
+  console.log(`💾 Auth sessions dir: ${AUTH_DIR}`);
+
+  // Restore sessions after server is listening
+  restoreSessions();
+});
+
+  for (const [agentId] of clients) {
+    const state = clientStates.get(agentId);
+    
+    if (state !== 'open' && state !== 'connecting' && !reconnectAttempts.has(agentId)) {
+      console.log(`🗑️ Cleaning up disconnected client: ${agentId} (state: ${state || 'unknown'})`);
+      await destroyClient(agentId, false); // Soft cleanup: preserve auth on disk
+      cleanedUp++;
+    }
+  }
+  
+  if (cleanedUp > 0) {
+    console.log(`✅ Cleaned up ${cleanedUp} inactive clients. Remaining: ${clients.size}`);
+  } else {
+    console.log(`✅ No inactive clients to clean up`);
+  }
+}, CLEANUP_INTERVAL_MS);
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 WhatsApp Baileys Microservice running on port ${PORT}`);
