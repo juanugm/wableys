@@ -74,11 +74,18 @@ function jidToPhone(jid) {
 function resolveContactId(jid, pushName, store) {
   // If it's a LID (@lid), try to get real number from store
   if (jid && jid.includes('@lid')) {
-    // Try store contacts first
+    // Try store contacts first - check if contact has a non-LID id
     if (store && store.contacts) {
       const contact = store.contacts[jid];
       if (contact && contact.id && !contact.id.includes('@lid')) {
         return contact.id;
+      }
+      // Also scan contacts for matching phone number via lid field
+      for (const [contactJid, contactData] of Object.entries(store.contacts)) {
+        if (contactData.lid === jid && !contactJid.includes('@lid')) {
+          console.log(`✅ LID resolved via store.contacts.lid field: ${jid} -> ${contactJid}`);
+          return contactJid;
+        }
       }
     }
     // Fallback: use pushName as identifier if available
@@ -463,6 +470,11 @@ async function initializeClient(agentId, isReconnect = false) {
           const unwrappedContent = unwrapMessage(messageContent);
           const { type: messageType, baileysType } = detectMessageType(messageContent);
           
+          // Detect if original JID was a LID
+          const originalJid = remoteJid;
+          const isLid = originalJid && originalJid.includes('@lid');
+          const participantIsLid = participant && participant.includes('@lid');
+          
           // Build metadata (same structure as original webhook)
           let messageMetadata = {
             timestamp: msg.messageTimestamp,
@@ -470,7 +482,19 @@ async function initializeClient(agentId, isReconnect = false) {
             participant: participant,
             source: 'whatsapp_personal',
             from_me: fromMe,
-            ...(senderName && { sender_name: senderName })
+            ...(senderName && { sender_name: senderName }),
+            // LID resolution info: always send original LID + resolved phone
+            ...(isLid && { 
+              original_lid: jidToPhone(originalJid),
+              resolved_phone: conversationTarget !== originalJid ? jidToPhone(conversationTarget) : null
+            }),
+            ...(participantIsLid && {
+              participant_lid: jidToPhone(participant),
+              participant_resolved_phone: (() => {
+                const resolved = resolveContactId(participant, null, store);
+                return resolved !== participant ? jidToPhone(resolved) : null;
+              })()
+            })
           };
           
           // Download multimedia (only for received messages)
