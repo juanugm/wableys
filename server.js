@@ -24,7 +24,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || '*';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
 // ⚙️ OPTIMIZATION SETTINGS (same as before)
-const MAX_CONCURRENT_SESSIONS = 5;
+const MAX_CONCURRENT_SESSIONS = parseInt(process.env.MAX_CLIENTS || '100', 10);
 const QR_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes to scan QR
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // Cleanup every 5 minutes
 
