@@ -43,8 +43,10 @@ const clientStates = new Map(); // agentId -> 'connecting' | 'open' | 'close'
 const reconnectAttempts = new Map(); // agentId -> reconnect attempt count
 const sentMessages = new Map();     // messageId -> { conversation: content } for retry decryption
 
-const MAX_RECONNECT_ATTEMPTS = 5;
+const MAX_RECONNECT_ATTEMPTS = 3;
 const MAX_SENT_MESSAGES_CACHE = 1000;
+const RECONNECT_COOLDOWN_MS = 30000; // Min 30s between reconnections
+const lastSuccessfulConnect = new Map(); // agentId -> timestamp
 
 // Auth sessions directory
 const AUTH_DIR = path.join(__dirname, 'auth_sessions');
@@ -243,11 +245,13 @@ async function initializeClient(agentId, isReconnect = false) {
       auth: state,
       logger,
       version,
-      browser: ['Baileys', 'Chrome', '4.0.0'],
+      browser: ['insuranai', 'Desktop', '1.0.0'],
       printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      keepAliveIntervalMs: 30000,
+      retryRequestDelayMs: 500,
       getMessage: async (key) => {
         const msg = sentMessages.get(key.id);
         if (msg) {
@@ -313,6 +317,7 @@ async function initializeClient(agentId, isReconnect = false) {
         clearQrTimeout(agentId);
         clientStates.set(agentId, 'open');
         reconnectAttempts.delete(agentId); // Reset reconnect counter on success
+        lastSuccessfulConnect.set(agentId, Date.now());
         
         const phoneNumber = jidToPhone(sock.user?.id || '');
         console.log(`📞 Phone number: ${phoneNumber}`);
@@ -363,12 +368,20 @@ async function initializeClient(agentId, isReconnect = false) {
           const attempts = (reconnectAttempts.get(agentId) || 0) + 1;
           reconnectAttempts.set(agentId, attempts);
           
+          // Cooldown: if last successful connect was very recent, wait longer
+          const lastConnect = lastSuccessfulConnect.get(agentId) || 0;
+          const timeSinceLastConnect = Date.now() - lastConnect;
+          const cooldownDelay = timeSinceLastConnect < RECONNECT_COOLDOWN_MS 
+            ? RECONNECT_COOLDOWN_MS - timeSinceLastConnect 
+            : 0;
+          
           if (attempts <= MAX_RECONNECT_ATTEMPTS) {
-            const delay = Math.min(attempts * 2000, 10000);
-            console.log(`🔄 Reconnect attempt ${attempts}/${MAX_RECONNECT_ATTEMPTS} for ${agentId} in ${delay/1000}s...`);
+            const baseDelay = Math.min(attempts * 3000, 15000);
+            const delay = Math.max(baseDelay, cooldownDelay);
+            console.log(`🔄 Reconnect attempt ${attempts}/${MAX_RECONNECT_ATTEMPTS} for ${agentId} in ${delay/1000}s (cooldown: ${cooldownDelay/1000}s)...`);
             await new Promise(r => setTimeout(r, delay));
             try {
-              const reconnected = await initializeClient(agentId, true); // true = reconnect, preserve auth
+              const reconnected = await initializeClient(agentId, true);
               clients.set(agentId, reconnected);
             } catch (reconnectError) {
               console.error(`❌ Reconnect failed for ${agentId}:`, reconnectError.message);
@@ -470,12 +483,12 @@ async function initializeClient(agentId, isReconnect = false) {
           const unwrappedContent = unwrapMessage(messageContent);
           const { type: messageType, baileysType } = detectMessageType(messageContent);
           
-          // Detect if original JID was a LID
+          // Always capture both original JID and resolved target
           const originalJid = remoteJid;
           const isLid = originalJid && originalJid.includes('@lid');
           const participantIsLid = participant && participant.includes('@lid');
           
-          // Build metadata (same structure as original webhook)
+          // Build metadata - ALWAYS send both original_jid and phone info
           let messageMetadata = {
             timestamp: msg.messageTimestamp,
             from: conversationTarget,
@@ -483,17 +496,23 @@ async function initializeClient(agentId, isReconnect = false) {
             source: 'whatsapp_personal',
             from_me: fromMe,
             ...(senderName && { sender_name: senderName }),
-            // LID resolution info: always send original LID + resolved phone
-            ...(isLid && { 
-              original_lid: jidToPhone(originalJid),
-              resolved_phone: conversationTarget !== originalJid ? jidToPhone(conversationTarget) : null
-            }),
-            ...(participantIsLid && {
-              participant_lid: jidToPhone(participant),
-              participant_resolved_phone: (() => {
+            // Always send the original JID (could be phone@s.whatsapp.net or LID@lid)
+            original_jid: originalJid,
+            // Always send the phone number (extracted from resolved target)
+            phone_number: jidToPhone(conversationTarget),
+            // LID info (null if not a LID)
+            lid: isLid ? jidToPhone(originalJid) : null,
+            // If LID was resolved to a different JID, send the resolved phone
+            resolved_from_lid: isLid && conversationTarget !== originalJid ? true : false,
+            // Participant LID info for groups
+            ...(participant && {
+              participant_jid: participant,
+              participant_phone: jidToPhone(participantIsLid ? resolveContactId(participant, null, store) : participant),
+              participant_lid: participantIsLid ? jidToPhone(participant) : null,
+              participant_resolved_phone: participantIsLid ? (() => {
                 const resolved = resolveContactId(participant, null, store);
                 return resolved !== participant ? jidToPhone(resolved) : null;
-              })()
+              })() : null
             })
           };
           
@@ -1121,3 +1140,4 @@ app.listen(PORT, () => {
   // Restore sessions after server is listening
   restoreSessions();
 });
+
