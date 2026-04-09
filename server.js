@@ -42,10 +42,13 @@ const qrTimeouts = new Map();   // agentId -> timeout handle
 const clientStates = new Map(); // agentId -> 'connecting' | 'open' | 'close'
 const reconnectAttempts = new Map(); // agentId -> reconnect attempt count
 const sentMessages = new Map();     // messageId -> { conversation: content } for retry decryption
+const lastEdgeFunctionNotify = new Map(); // agentId -> timestamp of last edge function notification
+const isFirstConnection = new Map();      // agentId -> boolean (true if QR was just scanned)
 
-const MAX_RECONNECT_ATTEMPTS = 3;
+const MAX_RECONNECT_ATTEMPTS = 5;
 const MAX_SENT_MESSAGES_CACHE = 1000;
 const RECONNECT_COOLDOWN_MS = 30000; // Min 30s between reconnections
+const EDGE_NOTIFY_COOLDOWN_MS = 60 * 60 * 1000; // 60 minutes between edge function notifications
 const lastSuccessfulConnect = new Map(); // agentId -> timestamp
 
 // Auth sessions directory
@@ -284,6 +287,7 @@ async function initializeClient(agentId, isReconnect = false) {
       // QR Code generated
       if (qr) {
         console.log(`📲 QR Code generated for ${agentId}`);
+        isFirstConnection.set(agentId, true); // Mark as new QR connection
         try {
           const qrImage = await QRCode.toDataURL(qr);
           qrCodes.set(agentId, qrImage);
@@ -320,28 +324,39 @@ async function initializeClient(agentId, isReconnect = false) {
         lastSuccessfulConnect.set(agentId, Date.now());
         
         const phoneNumber = jidToPhone(sock.user?.id || '');
-        console.log(`📞 Phone number: ${phoneNumber}`);
         
-        // Notify edge function about successful connection
-        try {
-          const response = await fetch('https://wmzbqsegsyagcjgxefqs.supabase.co/functions/v1/whatsapp-personal-connect', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'connected',
-              agent_id: agentId,
-              phone_number: phoneNumber,
-              session_id: agentId
-            })
-          });
-          
-          if (!response.ok) {
-            console.error('Failed to notify edge function:', await response.text());
-          } else {
-            console.log('✅ Edge function notified of connection');
+        // Determine if we should notify edge function
+        const isNewConnection = isFirstConnection.get(agentId) === true;
+        const lastNotify = lastEdgeFunctionNotify.get(agentId) || 0;
+        const timeSinceLastNotify = Date.now() - lastNotify;
+        const shouldNotify = isNewConnection || timeSinceLastNotify > EDGE_NOTIFY_COOLDOWN_MS;
+        
+        if (shouldNotify) {
+          console.log(`📞 Phone number: ${phoneNumber} (notifying edge function, reason: ${isNewConnection ? 'new QR connection' : 'cooldown expired'})`);
+          try {
+            const response = await fetch('https://wmzbqsegsyagcjgxefqs.supabase.co/functions/v1/whatsapp-personal-connect', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'connected',
+                agent_id: agentId,
+                phone_number: phoneNumber,
+                session_id: agentId
+              })
+            });
+            
+            if (!response.ok) {
+              console.error('Failed to notify edge function:', await response.text());
+            } else {
+              console.log('✅ Edge function notified of connection');
+              lastEdgeFunctionNotify.set(agentId, Date.now());
+            }
+          } catch (error) {
+            console.error('Error notifying edge function:', error);
           }
-        } catch (error) {
-          console.error('Error notifying edge function:', error);
+          isFirstConnection.delete(agentId);
+        } else {
+          console.log(`✅ Reconnected ${agentId} (skipping edge function notify, last was ${Math.round(timeSinceLastNotify / 1000)}s ago)`);
         }
         
         qrCodes.delete(agentId);
@@ -1140,4 +1155,3 @@ app.listen(PORT, () => {
   // Restore sessions after server is listening
   restoreSessions();
 });
-
