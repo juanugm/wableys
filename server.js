@@ -514,7 +514,8 @@ async function initializeClient(agentId, isReconnect = false) {
             // Always send the original JID (could be phone@s.whatsapp.net or LID@lid)
             original_jid: originalJid,
             // Always send the phone number (extracted from resolved target)
-            phone_number: jidToPhone(conversationTarget),
+            // Only send phone_number if Baileys actually resolved the LID to a real phone
+            phone_number: (isLid && conversationTarget === originalJid) ? null : jidToPhone(conversationTarget),
             // LID info (null if not a LID)
             lid: isLid ? jidToPhone(originalJid) : null,
             // If LID was resolved to a different JID, send the resolved phone
@@ -522,7 +523,12 @@ async function initializeClient(agentId, isReconnect = false) {
             // Participant LID info for groups
             ...(participant && {
               participant_jid: participant,
-              participant_phone: jidToPhone(participantIsLid ? resolveContactId(participant, null, store) : participant),
+              participant_phone: (() => {
+                if (!participantIsLid) return jidToPhone(participant);
+                const resolved = resolveContactId(participant, null, store);
+                // Only send phone if actually resolved to a different JID
+                return resolved !== participant ? jidToPhone(resolved) : null;
+              })(),
               participant_lid: participantIsLid ? jidToPhone(participant) : null,
               participant_resolved_phone: participantIsLid ? (() => {
                 const resolved = resolveContactId(participant, null, store);
