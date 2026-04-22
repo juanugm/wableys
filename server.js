@@ -44,6 +44,7 @@ const reconnectAttempts = new Map(); // agentId -> reconnect attempt count
 const sentMessages = new Map();     // messageId -> { conversation: content } for retry decryption
 const lastEdgeFunctionNotify = new Map(); // agentId -> timestamp of last edge function notification
 const isFirstConnection = new Map();      // agentId -> boolean (true if QR was just scanned)
+const lidToPhoneCache = new Map();        // agentId -> Map<lidJid, phoneJid> in-memory LID resolution cache
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const MAX_SENT_MESSAGES_CACHE = 1000;
@@ -75,27 +76,95 @@ function jidToPhone(jid) {
   return jid.split('@')[0].split(':')[0];
 }
 
-// Helper: resolve LID to real phone number
-function resolveContactId(jid, pushName, store) {
-  // If it's a LID (@lid), try to get real number from store
-  if (jid && jid.includes('@lid')) {
-    // Try store contacts first - check if contact has a non-LID id
-    if (store && store.contacts) {
-      const contact = store.contacts[jid];
-      if (contact && contact.id && !contact.id.includes('@lid')) {
-        return contact.id;
-      }
-      // Also scan contacts for matching phone number via lid field
-      for (const [contactJid, contactData] of Object.entries(store.contacts)) {
-        if (contactData.lid === jid && !contactJid.includes('@lid')) {
-          console.log(`✅ LID resolved via store.contacts.lid field: ${jid} -> ${contactJid}`);
-          return contactJid;
+// Helper: get or create LID cache for an agent
+function getLidCache(agentId) {
+  let cache = lidToPhoneCache.get(agentId);
+  if (!cache) {
+    cache = new Map();
+    lidToPhoneCache.set(agentId, cache);
+  }
+  return cache;
+}
+
+// Helper: load persisted lid-mapping-*.json files into in-memory cache
+function loadLidMappingsFromDisk(agentId) {
+  try {
+    const dir = path.join(AUTH_DIR, agentId);
+    if (!fsSync.existsSync(dir)) return 0;
+    const files = fsSync.readdirSync(dir).filter(f => f.startsWith('lid-mapping-') && f.endsWith('.json'));
+    const cache = getLidCache(agentId);
+    let loaded = 0;
+    for (const f of files) {
+      try {
+        const raw = fsSync.readFileSync(path.join(dir, f), 'utf8');
+        const data = JSON.parse(raw);
+        // Files are typically { "lidUser": "phoneUser" } or wrapped
+        const entries = data && typeof data === 'object' ? Object.entries(data) : [];
+        for (const [k, v] of entries) {
+          if (typeof k === 'string' && typeof v === 'string') {
+            const lidJid = k.includes('@') ? k : `${k}@lid`;
+            const phoneJid = v.includes('@') ? v : `${v}@s.whatsapp.net`;
+            cache.set(lidJid, phoneJid);
+            loaded++;
+          }
         }
+      } catch (e) { /* ignore individual file parse errors */ }
+    }
+    if (loaded > 0) console.log(`📂 Loaded ${loaded} LID mappings from disk for ${agentId}`);
+    return loaded;
+  } catch (e) {
+    console.warn(`⚠️ loadLidMappingsFromDisk error for ${agentId}:`, e.message);
+    return 0;
+  }
+}
+
+// Helper: resolve LID to real phone number — 4-layer strategy
+// Returns the resolved JID (phone JID if found, original LID if not).
+async function resolveContactId(jid, pushName, store, sock, agentId) {
+  if (!jid) return jid;
+  // Layer 1: already a phone JID
+  if (!jid.includes('@lid')) return jid;
+
+  // Layer 2: Baileys official LID mapping store (signal repository)
+  try {
+    const lidMapping = sock?.signalRepository?.lidMapping;
+    if (lidMapping && typeof lidMapping.getPNForLID === 'function') {
+      const pn = await lidMapping.getPNForLID(jid);
+      if (pn && typeof pn === 'string' && !pn.includes('@lid')) {
+        // cache for future
+        if (agentId) getLidCache(agentId).set(jid, pn);
+        return pn;
       }
     }
-    // Fallback: use pushName as identifier if available
-    console.log(`⚠️ LID detected: ${jid}, pushName: ${pushName}`);
+  } catch (e) {
+    // silent — fall through to next layer
   }
+
+  // Layer 3: store.contacts (legacy)
+  if (store && store.contacts) {
+    const contact = store.contacts[jid];
+    if (contact && contact.id && !contact.id.includes('@lid')) {
+      if (agentId) getLidCache(agentId).set(jid, contact.id);
+      return contact.id;
+    }
+    for (const [contactJid, contactData] of Object.entries(store.contacts)) {
+      if (contactData.lid === jid && !contactJid.includes('@lid')) {
+        console.log(`✅ LID resolved via store.contacts.lid field: ${jid} -> ${contactJid}`);
+        if (agentId) getLidCache(agentId).set(jid, contactJid);
+        return contactJid;
+      }
+    }
+  }
+
+  // Layer 4: in-memory cache (populated by messaging-history.set + disk)
+  if (agentId) {
+    const cached = getLidCache(agentId).get(jid);
+    if (cached && !cached.includes('@lid')) {
+      return cached;
+    }
+  }
+
+  console.log(`⚠️ LID unresolved after 4 layers: ${jid}, pushName: ${pushName}`);
   return jid;
 }
 
@@ -232,6 +301,9 @@ async function initializeClient(agentId, isReconnect = false) {
   // Simple in-memory contacts store (makeInMemoryStore removed in newer Baileys)
   const store = { contacts: {} };
   
+  // Pre-load any persisted LID mappings from previous sessions into in-memory cache
+  loadLidMappingsFromDisk(agentId);
+  
   // Fetch latest WA version for protocol compatibility
   let version;
   try {
@@ -275,6 +347,29 @@ async function initializeClient(agentId, isReconnect = false) {
         if (store.contacts[u.id]) {
           Object.assign(store.contacts[u.id], u);
         }
+        // Capture LID↔phone mappings exposed via contact updates
+        if (u.id && u.lid && u.id.includes('@s.whatsapp.net') && u.lid.includes('@lid')) {
+          getLidCache(agentId).set(u.lid, u.id);
+        }
+      }
+    });
+
+    // Capture LID mappings from history sync (initial connection + ongoing)
+    sock.ev.on('messaging-history.set', ({ contacts: histContacts }) => {
+      try {
+        if (!Array.isArray(histContacts)) return;
+        const cache = getLidCache(agentId);
+        let added = 0;
+        for (const c of histContacts) {
+          if (c?.id && c?.lid && c.id.includes('@s.whatsapp.net') && c.lid.includes('@lid')) {
+            if (!cache.has(c.lid)) added++;
+            cache.set(c.lid, c.id);
+          }
+          if (c?.id) store.contacts[c.id] = c;
+        }
+        if (added > 0) console.log(`📚 Captured ${added} LID↔phone mappings from history for ${agentId}`);
+      } catch (e) {
+        console.warn('⚠️ messaging-history.set handler error:', e.message);
       }
     });
     
@@ -473,11 +568,16 @@ async function initializeClient(agentId, isReconnect = false) {
           const messageContent = msg.message;
           if (!messageContent) continue; // Protocol messages, skip
           
-          // Resolve conversation target (same logic as original)
-          const conversationTarget = resolveContactId(remoteJid, msg.pushName, store);
+          // Resolve conversation target (4-layer LID resolution, async)
+          const conversationTarget = await resolveContactId(remoteJid, msg.pushName, store, sock, agentId);
           
           const isGroup = remoteJid.endsWith('@g.us');
           const participant = isGroup ? (msg.key.participant || null) : null;
+          
+          // Pre-resolve participant once (async) to avoid repeated calls
+          const resolvedParticipant = participant
+            ? await resolveContactId(participant, null, store, sock, agentId)
+            : null;
           
           // Get contact/group name
           let contactName = 'Unknown';
@@ -502,6 +602,7 @@ async function initializeClient(agentId, isReconnect = false) {
           const originalJid = remoteJid;
           const isLid = originalJid && originalJid.includes('@lid');
           const participantIsLid = participant && participant.includes('@lid');
+          const participantResolvedDifferent = participantIsLid && resolvedParticipant && resolvedParticipant !== participant;
           
           // Build metadata - ALWAYS send both original_jid and phone info
           let messageMetadata = {
@@ -523,17 +624,13 @@ async function initializeClient(agentId, isReconnect = false) {
             // Participant LID info for groups
             ...(participant && {
               participant_jid: participant,
-              participant_phone: (() => {
-                if (!participantIsLid) return jidToPhone(participant);
-                const resolved = resolveContactId(participant, null, store);
-                // Only send phone if actually resolved to a different JID
-                return resolved !== participant ? jidToPhone(resolved) : null;
-              })(),
+              participant_phone: !participantIsLid
+                ? jidToPhone(participant)
+                : (participantResolvedDifferent ? jidToPhone(resolvedParticipant) : null),
               participant_lid: participantIsLid ? jidToPhone(participant) : null,
-              participant_resolved_phone: participantIsLid ? (() => {
-                const resolved = resolveContactId(participant, null, store);
-                return resolved !== participant ? jidToPhone(resolved) : null;
-              })() : null
+              participant_resolved_phone: participantIsLid && participantResolvedDifferent
+                ? jidToPhone(resolvedParticipant)
+                : null
             })
           };
           
@@ -1067,6 +1164,31 @@ app.get('/messages/:agent_id/:chat_id', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Error getting messages:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Resolve a LID to its real phone number on demand
+app.post('/resolve-lid', authMiddleware, async (req, res) => {
+  try {
+    const { agentId, lid } = req.body || {};
+    if (!agentId || !lid) {
+      return res.status(400).json({ error: 'agentId and lid are required' });
+    }
+    const clientData = clients.get(agentId);
+    if (!clientData || clientStates.get(agentId) !== 'open') {
+      return res.status(404).json({ error: 'Client not connected', resolved: false });
+    }
+    const lidJid = lid.includes('@') ? lid : `${lid}@lid`;
+    const resolved = await resolveContactId(lidJid, null, clientData.store, clientData.sock, agentId);
+    if (resolved && !resolved.includes('@lid')) {
+      const phone = jidToPhone(resolved);
+      console.log(`🔎 /resolve-lid ${agentId} ${lidJid} -> ${phone}`);
+      return res.json({ resolved: true, lid: lidJid, phone_number: phone, jid: resolved });
+    }
+    return res.json({ resolved: false, lid: lidJid });
+  } catch (error) {
+    console.error('Error in /resolve-lid:', error);
+    res.status(500).json({ error: error.message, resolved: false });
   }
 });
 
