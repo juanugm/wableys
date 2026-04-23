@@ -1192,6 +1192,62 @@ app.post('/resolve-lid', authMiddleware, async (req, res) => {
   }
 });
 
+// Active lookup of a JID/LID via onWhatsApp (queries WhatsApp servers directly)
+app.post('/lookup-jid', authMiddleware, async (req, res) => {
+  try {
+    const { agentId, lid } = req.body || {};
+    if (!agentId || !lid) {
+      return res.status(400).json({ error: 'agentId and lid are required', resolved: false });
+    }
+
+    const clientData = clients.get(agentId);
+    if (!clientData || clientStates.get(agentId) !== 'open') {
+      return res.status(404).json({ error: 'Client not connected', resolved: false });
+    }
+
+    const lidPure = String(lid).replace('@lid', '').replace('@s.whatsapp.net', '').replace(/\D/g, '');
+    if (!lidPure) {
+      return res.status(400).json({ error: 'invalid lid', resolved: false });
+    }
+
+    // 1) Try in-memory LID mapping first (cheap, no network)
+    try {
+      const cached = clientData.sock?.signalRepository?.lidMapping?.getPNForLID?.(`${lidPure}@lid`);
+      if (cached) {
+        const phone = String(cached).replace(/\D/g, '');
+        if (phone.length >= 8) {
+          console.log(`🔎 /lookup-jid ${agentId} ${lidPure}@lid -> ${phone} (lid_mapping_cache)`);
+          return res.json({ resolved: true, phone_number: phone, source: 'lid_mapping_cache' });
+        }
+      }
+    } catch (_) {
+      // ignore mapping errors and fall through to onWhatsApp
+    }
+
+    // 2) Active query to WhatsApp servers
+    try {
+      const results = await clientData.sock.onWhatsApp(`${lidPure}@lid`);
+      const hit = Array.isArray(results) ? results.find(r => r?.exists) || results[0] : null;
+      const jid = hit?.jid || hit?.lid || null;
+
+      if (jid && typeof jid === 'string' && jid.endsWith('@s.whatsapp.net')) {
+        const phone = jid.split('@')[0].replace(/\D/g, '');
+        if (phone.length >= 8) {
+          console.log(`🔎 /lookup-jid ${agentId} ${lidPure}@lid -> ${phone} (on_whatsapp)`);
+          return res.json({ resolved: true, phone_number: phone, source: 'on_whatsapp', jid });
+        }
+      }
+    } catch (err) {
+      console.warn(`⚠️ /lookup-jid onWhatsApp failed for ${lidPure}: ${err.message}`);
+    }
+
+    return res.json({ resolved: false, lid: `${lidPure}@lid` });
+  } catch (error) {
+    console.error('Error in /lookup-jid:', error);
+    res.status(500).json({ error: error.message, resolved: false });
+  }
+});
+
 // Disconnect
 app.post('/disconnect/:agent_id', authMiddleware, async (req, res) => {
   try {
