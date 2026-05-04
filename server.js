@@ -86,6 +86,44 @@ function getLidCache(agentId) {
   return cache;
 }
 
+// ─── PERSISTENCE OF LID↔PN MAPPINGS TO DISK ───
+// Debounced (10s) to avoid I/O storm. Survives container restarts on Railway.
+const persistLidMappingsTimers = new Map(); // agentId -> timeout
+const PERSIST_LID_DEBOUNCE_MS = 10000;
+
+async function persistLidMappingsNow(agentId) {
+  try {
+    const cache = lidToPhoneCache.get(agentId);
+    if (!cache || cache.size === 0) return;
+    const dir = path.join(AUTH_DIR, agentId);
+    if (!fsSync.existsSync(dir)) {
+      fsSync.mkdirSync(dir, { recursive: true });
+    }
+    const obj = {};
+    for (const [lid, pn] of cache.entries()) {
+      if (lid && pn && !pn.includes('@lid')) obj[lid] = pn;
+    }
+    const filePath = path.join(dir, 'lid-mapping-runtime.json');
+    const tmpPath = `${filePath}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(obj), 'utf8');
+    await fs.rename(tmpPath, filePath);
+    console.log(`💾 Persisted ${Object.keys(obj).length} LID mappings to disk for ${agentId}`);
+  } catch (e) {
+    console.warn(`⚠️ persistLidMappingsNow error for ${agentId}:`, e.message);
+  }
+}
+
+function schedulePersistLidMappings(agentId) {
+  if (!agentId) return;
+  const existing = persistLidMappingsTimers.get(agentId);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    persistLidMappingsTimers.delete(agentId);
+    persistLidMappingsNow(agentId).catch(() => {});
+  }, PERSIST_LID_DEBOUNCE_MS);
+  persistLidMappingsTimers.set(agentId, t);
+}
+
 // Helper: load persisted lid-mapping-*.json files into in-memory cache
 function loadLidMappingsFromDisk(agentId) {
   try {
@@ -338,19 +376,50 @@ async function initializeClient(agentId, isReconnect = false) {
     
     // Populate contacts store from socket events
     sock.ev.on('contacts.upsert', (contacts) => {
+      let added = 0;
       for (const c of contacts) {
         store.contacts[c.id] = c;
+        // Capture LID↔phone mappings exposed at upsert time (same as contacts.update)
+        if (c?.id && c?.lid && c.id.includes('@s.whatsapp.net') && c.lid.includes('@lid')) {
+          const cache = getLidCache(agentId);
+          if (!cache.has(c.lid)) added++;
+          cache.set(c.lid, c.id);
+        }
+      }
+      if (added > 0) {
+        console.log(`📚 Captured ${added} LID↔phone mappings from contacts.upsert for ${agentId}`);
+        schedulePersistLidMappings(agentId);
       }
     });
     sock.ev.on('contacts.update', (updates) => {
+      let added = 0;
       for (const u of updates) {
         if (store.contacts[u.id]) {
           Object.assign(store.contacts[u.id], u);
         }
         // Capture LID↔phone mappings exposed via contact updates
         if (u.id && u.lid && u.id.includes('@s.whatsapp.net') && u.lid.includes('@lid')) {
-          getLidCache(agentId).set(u.lid, u.id);
+          const cache = getLidCache(agentId);
+          if (!cache.has(u.lid)) added++;
+          cache.set(u.lid, u.id);
         }
+      }
+      if (added > 0) schedulePersistLidMappings(agentId);
+    });
+
+    // Pre-populate store.contacts from chats.upsert (canonical chat ids — usually PNs, not LIDs)
+    sock.ev.on('chats.upsert', (chats) => {
+      try {
+        if (!Array.isArray(chats)) return;
+        for (const chat of chats) {
+          if (!chat?.id) continue;
+          if (chat.id.includes('@lid') || chat.id.endsWith('@g.us')) continue;
+          if (!store.contacts[chat.id]) {
+            store.contacts[chat.id] = { id: chat.id, name: chat.name || undefined };
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ chats.upsert handler error:', e.message);
       }
     });
 
@@ -367,7 +436,10 @@ async function initializeClient(agentId, isReconnect = false) {
           }
           if (c?.id) store.contacts[c.id] = c;
         }
-        if (added > 0) console.log(`📚 Captured ${added} LID↔phone mappings from history for ${agentId}`);
+        if (added > 0) {
+          console.log(`📚 Captured ${added} LID↔phone mappings from history for ${agentId}`);
+          schedulePersistLidMappings(agentId);
+        }
       } catch (e) {
         console.warn('⚠️ messaging-history.set handler error:', e.message);
       }
@@ -569,7 +641,7 @@ async function initializeClient(agentId, isReconnect = false) {
           if (!messageContent) continue; // Protocol messages, skip
           
           // Resolve conversation target (4-layer LID resolution, async)
-          const conversationTarget = await resolveContactId(remoteJid, msg.pushName, store, sock, agentId);
+          let conversationTarget = await resolveContactId(remoteJid, msg.pushName, store, sock, agentId);
           
           const isGroup = remoteJid.endsWith('@g.us');
           const participant = isGroup ? (msg.key.participant || null) : null;
@@ -590,6 +662,25 @@ async function initializeClient(agentId, isReconnect = false) {
             }
           } else {
             contactName = getContactName(conversationTarget, store, msg.pushName);
+          }
+
+          // ─── ACTIVE FALLBACK: if remoteJid is LID and still unresolved, try one direct
+          // call to the Baileys signal repository before sending to webhook. This catches
+          // the race where contacts.upsert hasn't been processed yet on a client's first reply.
+          if (!isGroup && remoteJid.includes('@lid') && conversationTarget === remoteJid) {
+            try {
+              const lidMapping = sock?.signalRepository?.lidMapping;
+              if (lidMapping && typeof lidMapping.getPNForLID === 'function') {
+                const pn = await lidMapping.getPNForLID(remoteJid);
+                if (pn && typeof pn === 'string' && !pn.includes('@lid')) {
+                  conversationTarget = pn;
+                  contactName = getContactName(pn, store, msg.pushName);
+                  getLidCache(agentId).set(remoteJid, pn);
+                  schedulePersistLidMappings(agentId);
+                  console.log(`✅ LID resolved via active signalRepository call: ${remoteJid} -> ${pn}`);
+                }
+              }
+            } catch (_) { /* silent: keep original flow */ }
           }
           
           console.log(`📨 Message ${fromMe ? 'SENT' : 'RECEIVED'} ${fromMe ? 'to' : 'from'} ${contactName} (${jidToPhone(conversationTarget)})`);
@@ -1210,38 +1301,81 @@ app.post('/lookup-jid', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'invalid lid', resolved: false });
     }
 
-    // 1) Try in-memory LID mapping first (cheap, no network)
+    const lidJid = `${lidPure}@lid`;
+    const resolvePhoneFromJid = (jid) => {
+      if (!jid || typeof jid !== 'string' || jid.includes('@lid') || jid.endsWith('@g.us')) return null;
+      const phone = jidToPhone(jid).replace(/\D/g, '');
+      return phone.length >= 8 && phone.length <= 15 ? phone : null;
+    };
+
+    // 1) Fast in-memory cache populated from history/contact updates
     try {
-      const cached = clientData.sock?.signalRepository?.lidMapping?.getPNForLID?.(`${lidPure}@lid`);
-      if (cached) {
-        const phone = String(cached).replace(/\D/g, '');
-        if (phone.length >= 8) {
-          console.log(`🔎 /lookup-jid ${agentId} ${lidPure}@lid -> ${phone} (lid_mapping_cache)`);
-          return res.json({ resolved: true, phone_number: phone, source: 'lid_mapping_cache' });
+      const cachedJid = getLidCache(agentId).get(lidJid);
+      const phone = resolvePhoneFromJid(cachedJid);
+      if (phone) {
+        console.log(`🔎 /lookup-jid ${agentId} ${lidJid} -> ${phone} (memory_cache)`);
+        return res.json({ resolved: true, phone_number: phone, source: 'memory_cache', jid: cachedJid });
+      }
+    } catch (_) {
+      // ignore cache errors and continue
+    }
+
+    // 2) Baileys official LID mapping store (IMPORTANT: await getPNForLID)
+    try {
+      const pn = await clientData.sock?.signalRepository?.lidMapping?.getPNForLID?.(lidJid);
+      const phone = resolvePhoneFromJid(pn);
+      if (phone) {
+        getLidCache(agentId).set(lidJid, pn);
+        console.log(`🔎 /lookup-jid ${agentId} ${lidJid} -> ${phone} (signal_repository)`);
+        return res.json({ resolved: true, phone_number: phone, source: 'signal_repository', jid: pn });
+      }
+    } catch (_) {
+      // ignore mapping errors and fall through
+    }
+
+    // 3) Contacts store fallback
+    try {
+      const directContact = clientData.store?.contacts?.[lidJid];
+      const directPhone = resolvePhoneFromJid(directContact?.id);
+      if (directPhone) {
+        getLidCache(agentId).set(lidJid, directContact.id);
+        console.log(`🔎 /lookup-jid ${agentId} ${lidJid} -> ${directPhone} (store_direct)`);
+        return res.json({ resolved: true, phone_number: directPhone, source: 'store_direct', jid: directContact.id });
+      }
+
+      for (const [contactJid, contactData] of Object.entries(clientData.store?.contacts || {})) {
+        if (contactData?.lid === lidJid) {
+          const mappedPhone = resolvePhoneFromJid(contactJid);
+          if (mappedPhone) {
+            getLidCache(agentId).set(lidJid, contactJid);
+            console.log(`🔎 /lookup-jid ${agentId} ${lidJid} -> ${mappedPhone} (store_contacts)`);
+            return res.json({ resolved: true, phone_number: mappedPhone, source: 'store_contacts', jid: contactJid });
+          }
         }
       }
     } catch (_) {
-      // ignore mapping errors and fall through to onWhatsApp
+      // ignore store errors and continue
     }
 
-    // 2) Active query to WhatsApp servers
-    try {
-      const results = await clientData.sock.onWhatsApp(`${lidPure}@lid`);
-      const hit = Array.isArray(results) ? results.find(r => r?.exists) || results[0] : null;
-      const jid = hit?.jid || hit?.lid || null;
+    // 4) Active query to WhatsApp servers
+    for (const candidate of [lidJid, lidPure]) {
+      try {
+        const results = await clientData.sock.onWhatsApp(candidate);
+        const hit = Array.isArray(results) ? results.find(r => r?.exists) || results[0] : null;
+        const jid = hit?.jid || hit?.lid || null;
+        const phone = resolvePhoneFromJid(jid);
 
-      if (jid && typeof jid === 'string' && jid.endsWith('@s.whatsapp.net')) {
-        const phone = jid.split('@')[0].replace(/\D/g, '');
-        if (phone.length >= 8) {
-          console.log(`🔎 /lookup-jid ${agentId} ${lidPure}@lid -> ${phone} (on_whatsapp)`);
+        if (phone) {
+          getLidCache(agentId).set(lidJid, jid);
+          console.log(`🔎 /lookup-jid ${agentId} ${candidate} -> ${phone} (on_whatsapp)`);
           return res.json({ resolved: true, phone_number: phone, source: 'on_whatsapp', jid });
         }
+      } catch (err) {
+        console.warn(`⚠️ /lookup-jid onWhatsApp failed for ${candidate}: ${err.message}`);
       }
-    } catch (err) {
-      console.warn(`⚠️ /lookup-jid onWhatsApp failed for ${lidPure}: ${err.message}`);
     }
 
-    return res.json({ resolved: false, lid: `${lidPure}@lid` });
+    return res.json({ resolved: false, lid: lidJid });
   } catch (error) {
     console.error('Error in /lookup-jid:', error);
     res.status(500).json({ error: error.message, resolved: false });
