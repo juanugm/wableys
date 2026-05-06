@@ -948,7 +948,16 @@ async function initializeClient(agentId, isReconnect = false) {
               sender_name: senderName,
               from_me: fromMe,
               message_type: messageType,
-              message_metadata: messageMetadata
+              message_metadata: messageMetadata,
+              // ✅ Top-level message_id (Baileys msg.key.id) — needed by webhook to locate
+              // outbound messages by external_message_id and seed LID↔PN mapping on aia-echo.
+              message_id: msg.key?.id || null,
+              remote_jid: remoteJid,
+              // recipient_lid: when sending to a phone JID, Baileys sometimes exposes the
+              // recipient's LID in remoteJidAlt. Forward it so the webhook can seed the map.
+              recipient_lid: msg.key?.remoteJidAlt && String(msg.key.remoteJidAlt).includes('@lid')
+                ? String(msg.key.remoteJidAlt).split('@')[0]
+                : null
             })
           });
           
@@ -1184,10 +1193,21 @@ app.post('/send', authMiddleware, async (req, res) => {
     }
     
     console.log('✅ Message sent:', result.key.id);
-    
+
+    // Expose recipient LID (if Baileys returned one in remoteJidAlt) so the
+    // edge function can seed whatsapp_contact_map immediately on first send.
+    let recipientLid = null;
+    try {
+      if (result?.key?.remoteJidAlt && String(result.key.remoteJidAlt).includes('@lid')) {
+        recipientLid = String(result.key.remoteJidAlt).split('@')[0];
+      }
+    } catch (_) { /* ignore */ }
+
     res.json({
       success: true,
-      message_id: result.key.id
+      message_id: result.key.id,
+      remote_jid: result.key?.remoteJid || formattedNumber,
+      recipient_lid: recipientLid
     });
   } catch (error) {
     console.error('Error sending message:', error);
