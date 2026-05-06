@@ -705,6 +705,7 @@ async function initializeClient(agentId, isReconnect = false) {
             ...(senderName && { sender_name: senderName }),
             // Always send the original JID (could be phone@s.whatsapp.net or LID@lid)
             original_jid: originalJid,
+            peer_jid: originalJid,
             // Always send the phone number (extracted from resolved target)
             // Only send phone_number if Baileys actually resolved the LID to a real phone
             phone_number: (isLid && conversationTarget === originalJid) ? null : jidToPhone(conversationTarget),
