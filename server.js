@@ -695,6 +695,25 @@ async function initializeClient(agentId, isReconnect = false) {
           const participantIsLid = participant && participant.includes('@lid');
           const participantResolvedDifferent = participantIsLid && resolvedParticipant && resolvedParticipant !== participant;
           
+          // ─── Try to extract a real @s.whatsapp.net from the envelope itself ───
+          // Useful when remoteJid is @lid: Baileys often leaks the real PN via
+          // key.participantPn or contextInfo.participant. The webhook uses this
+          // to auto-seed whatsapp_contact_map without an extra round-trip.
+          let realJidFromEnvelope = null;
+          try {
+            const env = [
+              msg?.key?.participantPn,
+              msg?.message?.extendedTextMessage?.contextInfo?.participant,
+              msg?.message?.imageMessage?.contextInfo?.participant,
+              msg?.message?.documentMessage?.contextInfo?.participant,
+              msg?.message?.audioMessage?.contextInfo?.participant,
+              msg?.message?.videoMessage?.contextInfo?.participant,
+              msg?.message?.stickerMessage?.contextInfo?.participant,
+              msg?.key?.remoteJidAlt,
+            ];
+            realJidFromEnvelope = env.find((c) => typeof c === 'string' && c.endsWith('@s.whatsapp.net')) || null;
+          } catch (_) { /* ignore */ }
+          
           // Build metadata - ALWAYS send both original_jid and phone info
           let messageMetadata = {
             timestamp: msg.messageTimestamp,
@@ -713,6 +732,10 @@ async function initializeClient(agentId, isReconnect = false) {
             lid: isLid ? jidToPhone(originalJid) : null,
             // If LID was resolved to a different JID, send the resolved phone
             resolved_from_lid: isLid && conversationTarget !== originalJid ? true : false,
+            // Real PN leaked by the message envelope itself (when remoteJid is @lid)
+            real_jid_from_envelope: realJidFromEnvelope,
+            // Stanza ID for quoted-fallback when answering @lid contacts
+            stanza_id: msg?.key?.id || null,
             // Participant LID info for groups
             ...(participant && {
               participant_jid: participant,
@@ -1132,7 +1155,7 @@ app.get('/status/:agent_id', authMiddleware, async (req, res) => {
 // Send message
 app.post('/send', authMiddleware, async (req, res) => {
   try {
-    const { agent_id, to, content } = req.body;
+    const { agent_id, to, content, quoted_message_key, quoted_message_content } = req.body;
     
     if (!agent_id || !to || !content) {
       return res.status(400).json({ error: 'agent_id, to, and content are required' });
@@ -1149,19 +1172,25 @@ app.post('/send', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Client not connected' });
     }
     
-    console.log(`📤 Sending message to ${to}`);
+    console.log(`📤 Sending message to ${to}${quoted_message_key ? ' (with quoted)' : ''}`);
+    
+    const isLidTarget = typeof to === 'string' && to.endsWith('@lid');
     
     // Format phone number
     let formattedNumber = to;
-    if (!to.includes('@g.us') && !to.includes('@c.us')) {
+    if (isLidTarget) {
+      // LIDs are routable as-is when paired with a quoted message — do NOT
+      // run onWhatsApp() on them (returns "not registered") and do NOT rewrite the JID.
+      formattedNumber = to;
+    } else if (!to.includes('@g.us') && !to.includes('@c.us') && !to.includes('@s.whatsapp.net')) {
       formattedNumber = to.replace(/\D/g, '') + '@s.whatsapp.net';
     } else if (to.includes('@c.us')) {
       // Baileys uses @s.whatsapp.net for individual chats
       formattedNumber = to.replace('@c.us', '@s.whatsapp.net');
     }
     
-    // Verify number exists on WhatsApp and get correct JID
-    if (!to.includes('@g.us')) {
+    // Verify number exists on WhatsApp and get correct JID — only for real PNs.
+    if (!to.includes('@g.us') && !isLidTarget) {
       const rawNumber = formattedNumber.replace('@s.whatsapp.net', '');
       try {
         const [result] = await clientData.sock.onWhatsApp(rawNumber);
@@ -1181,7 +1210,20 @@ app.post('/send', authMiddleware, async (req, res) => {
       }
     }
     
-    const result = await clientData.sock.sendMessage(formattedNumber, { text: content });
+    // Build send options — include `quoted` when caller provided it. WhatsApp routes
+    // by stanzaId of the quoted message, so this lets us reply to @lid contacts even
+    // when the LID isn't yet resolved to a phone number.
+    const sendOptions = {};
+    if (quoted_message_key && typeof quoted_message_key === 'object') {
+      sendOptions.quoted = {
+        key: quoted_message_key,
+        message: quoted_message_content && typeof quoted_message_content === 'object'
+          ? quoted_message_content
+          : { conversation: '' },
+      };
+    }
+    
+    const result = await clientData.sock.sendMessage(formattedNumber, { text: content }, sendOptions);
     
     // Cache sent message for decryption retry (mobile "waiting for message" fix)
     if (result?.key?.id) {
@@ -1193,7 +1235,7 @@ app.post('/send', authMiddleware, async (req, res) => {
       }
     }
     
-    console.log('✅ Message sent:', result.key.id);
+    console.log('✅ Message sent:', result.key.id, 'remoteJid:', result?.key?.remoteJid);
 
     // Expose recipient LID (if Baileys returned one in remoteJidAlt) so the
     // edge function can seed whatsapp_contact_map immediately on first send.
@@ -1201,6 +1243,24 @@ app.post('/send', authMiddleware, async (req, res) => {
     try {
       if (result?.key?.remoteJidAlt && String(result.key.remoteJidAlt).includes('@lid')) {
         recipientLid = String(result.key.remoteJidAlt).split('@')[0];
+      } else if (isLidTarget) {
+        recipientLid = String(to).split('@')[0];
+      }
+    } catch (_) { /* ignore */ }
+    
+    // When sending to a @lid, Baileys may reveal the real @s.whatsapp.net JID
+    // in result.key.remoteJid. Persist that mapping in the LID cache and
+    // surface it to the caller so the edge function can heal the conversation.
+    let resolvedPeerJid = null;
+    try {
+      const rj = result?.key?.remoteJid;
+      if (rj && typeof rj === 'string' && rj.endsWith('@s.whatsapp.net')) {
+        resolvedPeerJid = rj;
+        if (isLidTarget) {
+          getLidCache(agent_id).set(to, rj);
+          schedulePersistLidMappings(agent_id);
+          console.log(`🌱 [/send] resolved LID via send: ${to} → ${rj}`);
+        }
       }
     } catch (_) { /* ignore */ }
 
@@ -1208,6 +1268,8 @@ app.post('/send', authMiddleware, async (req, res) => {
       success: true,
       message_id: result.key.id,
       remote_jid: result.key?.remoteJid || formattedNumber,
+      peer_jid: resolvedPeerJid,
+      peer_lid: isLidTarget ? to : null,
       recipient_lid: recipientLid
     });
   } catch (error) {
